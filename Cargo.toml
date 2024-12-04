@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.9.0"
-axum = "0.7.9"
-axum-server = "0.7.1"
-serde = "1.0.215"
-serde_json = "1.0.133"
-thiserror = "2.0.3"
-tokio = { version = "1.41.1", features = ["full"] }
-wasmtime = "27.0.0"
+axum = { version = "0.7.9", features = ["tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+wasmtime = { version = "15.0", features = ["component-model"] }
+wit-bindgen = { version = "0.16", features = ["realloc"] }
+sha2 = "0.10"

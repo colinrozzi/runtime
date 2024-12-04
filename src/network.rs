@@ -1,83 +1,47 @@
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
-use serde_json::json;
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{Actor, ActorError, ActorMessage};
+use crate::Runtime;
 
 #[derive(Clone)]
-pub struct ActorState {
-    inner: Arc<Mutex<Actor>>,
+pub struct SharedRuntime(Arc<Mutex<Runtime>>);
+
+#[derive(Debug, Deserialize)]
+pub struct Message {
+    data: Value,
 }
 
-pub async fn start_server(actor: Actor) -> Result<(), ActorError> {
-    let shared_state = ActorState {
-        inner: Arc::new(Mutex::new(actor)),
-    };
+#[derive(Debug, Serialize)]
+pub struct Response {
+    hash: String,
+    state: Value,
+}
+
+pub async fn serve(runtime: Runtime, addr: SocketAddr) -> anyhow::Result<()> {
+    let shared = SharedRuntime(Arc::new(Mutex::new(runtime)));
 
     let app = Router::new()
-        .route("/message", post(handle_message))
-        .route("/status", get(get_status))
-        .route("/state", get(get_state))
-        .route("/hashchain", get(get_hashchain))
-        .with_state(shared_state.clone());
+        .route("/", post(handle_message))
+        .with_state(shared);
 
-    let address = shared_state.inner.lock().await.address;
-    println!("Actor server starting on {}", address);
-
-    axum_server::Server::bind(&address)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|e| ActorError::ServerError(e.to_string()))?;
+    println!("Starting server on {}", addr);
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
     Ok(())
 }
 
 async fn handle_message(
-    State(state): State<ActorState>,
-    Json(message): Json<ActorMessage>,
-) -> Json<serde_json::Value> {
-    let mut actor = state.inner.lock().await;
-    match actor.handle(&message.content, &message.state).await {
-        Ok(()) => Json(json!({
-            "status": "success",
-            "from": message.from,
-            "last_hash": actor.get_last_hash()
-        })),
-        Err(e) => Json(json!({
-            "status": "error",
-            "error": e.to_string()
-        })),
+    State(shared): State<SharedRuntime>,
+    Json(message): Json<Message>,
+) -> Result<Json<Response>, (StatusCode, String)> {
+    let mut runtime = shared.0.lock().await;
+
+    match runtime.handle_message(message.data).await {
+        Ok((hash, state)) => Ok(Json(Response { hash, state })),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
-
-async fn get_status(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(json!({
-        "status": "healthy",
-        "name": actor.get_name(),
-        "address": actor.address.to_string()
-    }))
-}
-
-async fn get_state(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(json!({
-        "name": actor.get_name(),
-        "pending_messages": actor.wasm_component.get_pending_messages()
-    }))
-}
-
-async fn get_hashchain(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(json!({
-        "chain": actor.get_chain(),
-        "latest_hash": actor.get_last_hash()
-    }))
-}
-

@@ -1,115 +1,80 @@
-use thiserror::Error;
-use wasmtime::component::ComponentExportIndex;
-use wasmtime::component::{Component, Instance, Linker};
-use wasmtime::{Engine, Store, StoreContextMut};
+use anyhow::{Context, Result};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use wasmtime::component::*;
+use wasmtime::{Config, Engine, Store};
 
-#[derive(Error, Debug)]
-pub enum WasmComponentError {
-    #[error("WASM initialization failed: {0}")]
-    InitError(String),
-    #[error("WASM message handling failed: {0}")]
-    HandleError(String),
+// Host implementation of runtime interface
+wit_bindgen::generate!({
+    world: "first-actor",
+    path: "wit"
+});
+
+#[derive(Default)]
+struct RuntimeImpl {
+    messages: Vec<String>,
+}
+
+impl runtime::Host for RuntimeImpl {
+    fn log(&mut self, msg: &str) {
+        println!("[WASM] {}", msg);
+    }
+
+    fn send(&mut self, actor_id: &str, msg: &Value) {
+        self.messages.push(format!("To {}: {:?}", actor_id, msg));
+    }
 }
 
 pub struct WasmComponent {
-    wasm_path: String,
-    engine: Engine,
-    component: Component,
-    instance: Instance,
-    store: Store<()>,
-    linker: Linker<()>,
-    init_index: ComponentExportIndex,
-    handle_index: ComponentExportIndex,
+    store: Store<RuntimeImpl>,
+    instance: ComponentInstance,
 }
 
 impl WasmComponent {
-    pub fn new(wasm_path: String, actor_name: String) -> Self {
-        let engine = Engine::default();
-        let bytes = std::fs::read(wasm_path.clone()).expect("Failed to read wasm file");
-        let component = Component::new(&engine, &bytes).expect("Failed to create component");
+    pub fn new(wasm_path: &str) -> Result<(Self, String)> {
+        // Read and hash component
+        let wasm_bytes = std::fs::read(wasm_path).context("Failed to read WASM file")?;
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let component_hash = format!("{:x}", hasher.finalize());
 
-        let mut store = Store::new(&engine, ());
-
+        // Set up wasmtime
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config)?;
+        let component = Component::new(&engine, &wasm_bytes)?;
         let mut linker = Linker::new(&engine);
-        let mut runtime = linker
-            .instance("ntwk:simple-actor/runtime")
-            .expect("Failed to get runtime instance");
+        runtime::add_to_linker(&mut linker, |state: &mut RuntimeImpl| state)?;
 
-        let name_copy = actor_name.clone();
-        runtime
-            .func_wrap(
-                "log",
-                move |ctx: StoreContextMut<'_, ()>, (log,): (String,)| {
-                    println!("{}: {}", name_copy, log);
-                    Ok(())
-                },
-            )
-            .expect("Failed to wrap log function");
+        // Create store and instance
+        let mut store = Store::new(&engine, RuntimeImpl::default());
+        let instance = linker.instantiate(&mut store, &component)?;
 
-        runtime.func_wrap(
-            "send",
-            move |ctx: StoreContextMut<'_, ()>, (actor_id, msg): (String, String)| {
-                println!("send [actor-id : {}] [msg : {}]", actor_id, msg);
+        Ok((Self { store, instance }, component_hash))
+    }
 
-                Ok(())
-            },
-        );
+    pub fn init(&mut self) -> Result<Value> {
+        let actor = Actor::new(&mut self.store, &self.instance)?;
+        actor
+            .init(&mut self.store)
+            .context("Failed to initialize actor")
+    }
 
-        let instance = linker
-            .instantiate(&mut store, &component)
-            .expect("Failed to instantiate");
+    pub fn handle(&mut self, msg: Value, state: Value) -> Result<Value> {
+        let actor = Actor::new(&mut self.store, &self.instance)?;
 
-        let (_, instance_index) = component
-            .export_index(None, "ntwk:simple-actor/actor")
-            .expect("Failed to get export index");
-
-        let (_, init_index) = component
-            .export_index(Some(&instance_index), "init")
-            .expect("Failed to get export index for init");
-
-        let (_, handle_index) = component
-            .export_index(Some(&instance_index), "handle")
-            .expect("Failed to get export index for handle");
-
-        WasmComponent {
-            wasm_path,
-            engine,
-            component,
-            instance,
-            store,
-            linker,
-            init_index,
-            handle_index,
+        // Verify message and state against contracts
+        if !actor.message_contract(&mut self.store, &msg, &state)? {
+            anyhow::bail!("Message failed contract verification");
         }
-    }
+        if !actor.state_contract(&mut self.store, &state)? {
+            anyhow::bail!("State failed contract verification");
+        }
 
-    pub async fn init(&mut self) -> Result<(), WasmComponentError> {
-        let init_func = self
-            .instance
-            .get_func(&mut self.store, self.init_index)
-            .expect("Failed to get init function");
-
-        let typed = init_func
-            .typed::<(), ()>(&self.store)
-            .map_err(|e| WasmComponentError::InitError(e.to_string()))?;
-        typed
-            .call(&mut self.store, ())
-            .map_err(|e| WasmComponentError::InitError(e.to_string()))?;
-        Ok(())
-    }
-
-    pub async fn handle(&mut self, msg: &str, state: &str) -> Result<(), WasmComponentError> {
-        let handle_func = self
-            .instance
-            .get_func(&mut self.store, self.handle_index)
-            .expect("Failed to get handle function");
-
-        let typed = handle_func
-            .typed::<(&str, &str), ()>(&self.store)
-            .map_err(|e| WasmComponentError::HandleError(e.to_string()))?;
-        typed
-            .call(&mut self.store, (msg, state))
-            .map_err(|e| WasmComponentError::HandleError(e.to_string()))?;
-        Ok(())
+        // Handle message
+        actor
+            .handle(&mut self.store, msg, state)
+            .context("Failed to handle message")
     }
 }
+

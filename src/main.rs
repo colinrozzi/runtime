@@ -1,24 +1,19 @@
-// okay. this project will take an actor, and will run that actor and create a hash chain along the
-// way.
-use runtime::Actor;
-use std::error::Error;
-
-// what is the question right now?
-// I don't know the proper w
+use std::net::SocketAddr;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let mut actor1 = Actor::new(
-        "../actor1/target/wasm32-unknown-unknown/release/actor1.wasm".to_string(),
-        "actor1".to_string(),
-    );
-    actor1.start().await?;
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <wasm_file> <port>", args[0]);
+        std::process::exit(1);
+    }
 
-    let mut actor2 = Actor::new(
-        "../actor2/target/wasm32-unknown-unknown/release/actor2.wasm".to_string(),
-        "actor2".to_string(),
-    );
-    actor2.start().await?;
+    let wasm_path = &args[1];
+    let port: u16 = args[2].parse()?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    let runtime = runtime::Runtime::new(wasm_path)?;
+    runtime.start(addr).await?;
 
     Ok(())
 }

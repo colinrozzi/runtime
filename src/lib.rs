@@ -1,152 +1,55 @@
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use thiserror::Error;
-use tokio::sync::Mutex;
-
 mod chain;
-use chain::HashChain;
-
 mod wasm;
+mod network;
+
+use anyhow::Result;
+use serde_json::Value;
+use std::net::SocketAddr;
+
+use chain::HashChain;
 use wasm::WasmComponent;
 
-mod network;
-use network::ActorState;
-
-#[derive(Error, Debug)]
-pub enum ActorError {
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("Server error: {0}")]
-    ServerError(String),
+pub struct Runtime {
+    chain: HashChain,
+    wasm: WasmComponent,
+    current_state: Option<Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ActorMessage {
-    from: String,
-    content: String,
-    state: String,
-}
+impl Runtime {
+    pub fn new(wasm_path: &str) -> Result<Self> {
+        let (wasm, component_hash) = WasmComponent::new(wasm_path)?;
+        let mut chain = HashChain::new();
+        chain.initialize(&component_hash);
 
-#[derive(Clone)]
-pub struct ActorState {
-    inner: Arc<Mutex<Actor>>,
-}
-
-pub struct Actor {
-    hash_chain: HashChain,
-    actor_name: String,
-    wasm_component: WasmComponent,
-    address: SocketAddr,
-}
-
-impl Actor {
-    pub fn new(
-        wasm_path: String,
-        actor_name: String,
-        address: SocketAddr,
-    ) -> Result<Self, ActorError> {
-        Ok(Actor {
-            hash_chain: HashChain::new(),
-            actor_name: actor_name.clone(),
-            wasm_component: WasmComponent::new(wasm_path, actor_name)?,
-            address,
+        Ok(Self {
+            chain,
+            wasm,
+            current_state: None,
         })
     }
 
-    pub async fn start_server(self) -> Result<(), ActorError> {
-        let shared_state = ActorState {
-            inner: Arc::new(Mutex::new(self)),
-        };
+    pub async fn start(self, addr: SocketAddr) -> Result<()> {
+        // Initialize WASM component and store initial state
+        let mut this = self;
+        let initial_state = this.wasm.init()?;
+        this.current_state = Some(initial_state.clone());
+        this.chain.add(initial_state);
 
-        let app = Router::new()
-            .route("/message", post(handle_message))
-            .route("/status", get(get_status))
-            .route("/state", get(get_state))
-            .route("/hashchain", get(get_hashchain))
-            .with_state(shared_state.clone());
-
-        println!(
-            "Actor server starting on {}",
-            shared_state.inner.lock().await.address
-        );
-
-        axum_server::Server::bind(&shared_state.inner.lock().await.address)
-            .serve(app.into_make_service())
-            .await
-            .map_err(|e| ActorError::ServerError(e.to_string()))?;
-
-        Ok(())
+        // Start network server
+        network::serve(this, addr).await
     }
 
-    pub async fn handle(&mut self, msg: &str, state: &str) -> Result<(), ActorError> {
-        let record = format!("handle {} {}", msg, state);
-        self.hash_chain.add(record);
-        self.wasm_component
-            .handle(msg, state)
-            .await
-            .map_err(|e| ActorError::HandleError(e.to_string()))?;
-        Ok(())
+    pub async fn handle_message(&mut self, message: Value) -> Result<(String, Value)> {
+        let current_state = self.current_state.clone()
+            .expect("State not initialized");
+
+        // Handle message and get new state
+        let new_state = self.wasm.handle(message.clone(), current_state)?;
+        
+        // Add to chain and update current state
+        let hash = self.chain.add(new_state.clone());
+        self.current_state = Some(new_state.clone());
+
+        Ok((hash, new_state))
     }
-
-    pub fn get_chain(&self) -> &[String] {
-        self.hash_chain.get()
-    }
-
-    pub fn get_last_hash(&self) -> Option<&String> {
-        self.hash_chain.get_last()
-    }
-
-    pub fn get_name(&self) -> &str {
-        &self.actor_name
-    }
-}
-
-// HTTP endpoint handlers
-async fn handle_message(
-    State(state): State<ActorState>,
-    Json(message): Json<ActorMessage>,
-) -> Json<serde_json::Value> {
-    let mut actor = state.inner.lock().await;
-    match actor.handle(&message.content, &message.state).await {
-        Ok(()) => Json(serde_json::json!({
-            "status": "success",
-            "from": message.from,
-            "last_hash": actor.get_last_hash()
-        })),
-        Err(e) => Json(serde_json::json!({
-            "status": "error",
-            "error": e.to_string()
-        })),
-    }
-}
-
-async fn get_status(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(serde_json::json!({
-        "status": "healthy",
-        "name": actor.get_name(),
-        "address": actor.address.to_string()
-    }))
-}
-
-async fn get_state(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(serde_json::json!({
-        "name": actor.get_name(),
-        "pending_messages": actor.wasm_component.get_pending_messages()
-    }))
-}
-
-async fn get_hashchain(State(state): State<ActorState>) -> Json<serde_json::Value> {
-    let actor = state.inner.lock().await;
-    Json(serde_json::json!({
-        "chain": actor.get_chain(),
-        "latest_hash": actor.get_last_hash()
-    }))
 }
